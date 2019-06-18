@@ -1,0 +1,183 @@
+/******************************************************************************************
+ * PID Temperatura
+ *
+ * Este programa implementa un control PID en la tarjeta TM4C123G de Texas Instruments,
+ * basada en el microcontrolador Tiva TM4C123GH6PM.
+
+ *******************************************************************************************/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "inc/tm4c123gh6pm.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/gpio.h"
+#include "driverlib/timer.h"
+#include "driverlib/adc.h"
+#include "inc/hw_ssi.h"
+#include "driverlib/ssi.h"
+#include "driverlib/pin_map.h"
+
+
+#define        FS       1000         // Número de muestras por segundo
+
+uint32_t    muestra=0, B=0, B2=0, aux, salida;     // Variable para leer el ADC
+uint32_t    ui32Period;           // Periodo para escribir en el temporizador
+
+/****************************************************
+ * Variables
+ ****************************************************/
+
+double        y      =    0.0;
+double        yn1    =    0.0;
+double        yn2    =    0.0;
+double        e      =    0.0;
+double        yd     =    2.5;
+double        Kp     =    7.0;
+double        Ki     =    0.31;
+double 		  x		 =    0.0;
+double 		  u		 =    0.0;
+
+
+/***********************************************************************************
+ * Funcion que inicia la comunicación entre la TM4C123G y el DAC MCP4922 (Microchip)
+ * mediante SSI (SPI). Se transfieren 16 bits, 12 de datos y 4 de configuración. La
+ * velocidad del reloj es de 20MHz
+ ***********************************************************************************/
+
+void init_SSI0()
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI0);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    GPIOPinConfigure(GPIO_PA2_SSI0CLK);                 // Habilita el pin CLK
+    GPIOPinConfigure(GPIO_PA5_SSI0TX);                  // Habilita el pin TX
+    GPIOPinConfigure(GPIO_PA3_SSI0FSS);                 // Habilita el pin SS
+     // Habilita los pines para el módulo SSI
+    GPIOPinTypeSSI(GPIO_PORTA_BASE, GPIO_PIN_5 | GPIO_PIN_3 | GPIO_PIN_2);
+     // Habilita el módulo SSI0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI0);
+// Configuración de SSI0
+    SSIConfigSetExpClk(SSI0_BASE, SysCtlClockGet(), SSI_FRF_MOTO_MODE_0, SSI_MODE_MASTER, 20000000, 16);
+    SSIEnable(SSI0_BASE);                               // Habilita SSI0
+}
+
+/**************************************************************************
+ * Función que inicia el ADC con las siguientes características:
+ * - El Timer0 dispara el ADC basado en la frecuencia de muestreo
+ * - El ADC provoca una interrupción cada vez que ha leido una muestra
+ * - El canal de entrada del ADC es el canal 0
+ **************************************************************************/
+void init_ADC()
+{
+    /***********************************************
+     * Configuración de terminales de entrada/salida
+     ***********************************************/
+        // Habilitación del GPIOE. Entrada analógica en  AIN0 (PE3)
+                SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOE);
+                GPIOPinTypeGPIOInput(GPIO_PORTE_BASE, GPIO_PIN_3);
+                GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_3);
+        // Habilitación de GPIOF y las terminales conectadas al Led RGB
+                SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+                GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3);
+    /******************************************************
+     * Configuración del temporizador para disparar el ADC
+     ******************************************************/
+        // Timer 0 en funcionamiento periodico
+                SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+                TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
+        // Cálculo del periodo de muestreo en ciclos de reloj
+                ui32Period = SysCtlClockGet()/FS;
+                TimerLoadSet(TIMER0_BASE, TIMER_A, ui32Period - 1);
+
+                //TimerADCEventSet(TIMER0_BASE,    TIMER_ADC_TIMEOUT_A);
+
+    /*******************************************************
+     * Configuración del ADC
+     *******************************************************/
+        // Habilitación del ADC
+                SysCtlPeripheralEnable(SYSCTL_PERIPH_ADC0);
+        // Entrada analógica en AIN0 (PE3)
+                GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_3);
+        // Uso del secuenciador 3 (FIFO depth 1) para tomar solo una muestra por disparo
+                ADCSequenceDisable(ADC0_BASE, 3); // Deshabilitado para programarlo
+        // Habilitación del timer que disparará el ADC
+                TimerControlTrigger(TIMER0_BASE, TIMER_A, 1);
+        // Configuración del secuenciador
+                ADCSequenceConfigure(ADC0_BASE, 3, ADC_TRIGGER_TIMER, 0);
+        //
+                ADCSequenceStepConfigure(ADC0_BASE, 3, 0, ADC_CTL_CH0 | ADC_CTL_IE | ADC_CTL_END);
+                ADCSequenceEnable(ADC0_BASE, 3);
+                ADCIntEnable(ADC0_BASE, 3);
+                IntEnable(INT_ADC0SS3); //habilitamos la interrupcion del secuenciador 3
+                TimerEnable(TIMER0_BASE, TIMER_A);
+}
+
+/*******************************************
+ * Programa principal
+ *******************************************/
+ int main(void) {
+
+/********************************
+ * Reloj del sistema
+ *********************************/
+    // Establecimiento de la velocidad del reloj del sistema
+            SysCtlClockSet(SYSCTL_SYSDIV_5|SYSCTL_USE_PLL|SYSCTL_XTAL_16MHZ|SYSCTL_OSC_MAIN);
+
+/********************************
+* Rutinas de inicio de periféricos
+*********************************/
+
+            init_SSI0();
+            init_ADC();
+
+
+/************************************
+ * Habilitación global de interrupciones
+*************************************/
+            IntMasterEnable();
+
+/*****************************
+ * Ciclo ocioso infinito
+ *****************************/
+
+            while(1){ //1.5 en 1850, 3.0 en 3704
+            	if( B == 1 ){
+            		y = (muestra - 1850.0)/185.0;
+					//y = (aux*3.3)/ 4096.0; // Modificar lresolución.
+					//* - Calculo de la muestra de salida control PI
+					e = yd - y;
+					u = Kp + Ki*(e*FS + e*yn1);
+					yn1 = e*FS;
+					salida = (uint32_t)( (u*185.0) + 1850.0);
+            		if ( salida >= 3700.0 ){
+            				salida = 3700.0;
+					} else if (salida <= 1850){
+						salida = 1850.0;
+					}
+					// * - Envio de la muestra de salida al DAC
+					SSIDataPut(SSI0_BASE, (0x3000 | salida) & 0x3FFF);
+					while(SSIBusy(SSI0_BASE)){
+					}
+            	B=0;
+            	}
+
+            }
+            return 0;
+}
+
+/**************************************************
+* Rutina de atención a la interrupción del ADC
+*
+* En esta rutina se realiza todo el proceso para obtener las muestras
+* - Lectura de la muestra de entrada del ADC
+**************************************************/
+void ADC0SS3IntHandler(void){
+    ADCIntClear(ADC0_BASE,3);
+
+    ADCSequenceDataGet(ADC0_BASE,3,&muestra);
+    aux = muestra;
+    B=1;
+
+}
